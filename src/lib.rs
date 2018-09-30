@@ -109,7 +109,7 @@ macro_rules! dm_list_iterate {
     ($v:ty, $head:expr) => {
         let mut ptr: $v = (*$head).n;
         while ptr.field != (*$head) {
-            (t *)((v) - &((t *) 0)->head)
+            //(t *)((v) - &((t *) 0)->head)
         }
         /* 
         dm_list_iterate_items(v, head)
@@ -198,7 +198,7 @@ impl Lvm {
         let mut names: Vec<String> = vec![];
         unsafe {
             let mut vg_names = lvm_list_vg_names(self.handle);
-            dm_list_iterate!(lvm_str_list_t, vg_names);
+            //dm_list_iterate!(lvm_str_list_t, vg_names);
             loop {
                 println!("vg_names: {:p} vg_names.n:{:p} vg_names.p:{:p}", vg_names, (*vg_names).n, (*vg_names).p);
                 if (*vg_names).p == vg_names {
