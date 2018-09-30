@@ -1,0 +1,8 @@
+[package]
+name = "lvm"
+version = "0.1.0"
+authors = ["Chris Holcombe <xfactor973@gmail.com>"]
+
+[dependencies]
+errno = "*"
+lvm-sys = {path = "/home/chris/repos/lvm-sys"}
