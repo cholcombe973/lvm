@@ -5,4 +5,5 @@ authors = ["Chris Holcombe <xfactor973@gmail.com>"]
 
 [dependencies]
 errno = "*"
-lvm-sys = {git = "https://github.com/cholcombe973/lvm-sys"}
+lvm-sys = {path = "/home/chris/repos/lvm-sys"}
+uuid = "*"
