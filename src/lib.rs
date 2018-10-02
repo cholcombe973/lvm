@@ -1,4 +1,4 @@
-//!
+//!  Taken from the lvm2app.h header file:
 //!  The API is designed around the following basic LVM objects:
 //!  1) Physical Volume (pv_t) 2) Volume Group (vg_t) 3) Logical Volume (lv_t).
 //!
@@ -30,6 +30,8 @@
 //!  the new one obtained with WRITE permission.
 
 extern crate errno;
+#[macro_use]
+extern crate log;
 extern crate lvm_sys;
 extern crate uuid;
 
@@ -114,7 +116,10 @@ pub struct Lvm {
 impl Drop for Lvm {
     fn drop(&mut self) {
         unsafe {
-            lvm_quit(self.handle);
+            if !self.handle.is_null() {
+                debug!("dropping lvm");
+                lvm_quit(self.handle);
+            }
         }
     }
 }
@@ -190,7 +195,10 @@ pub struct VolumeGroup<'a> {
 impl<'a> Drop for VolumeGroup<'a> {
     fn drop(&mut self) {
         unsafe {
-            lvm_vg_close(self.handle);
+            if !self.handle.is_null() {
+                debug!("dropping vg");
+                lvm_vg_close(self.handle);
+            }
         }
     }
 }
