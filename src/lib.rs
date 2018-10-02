@@ -1,4 +1,4 @@
-//!
+//!  Taken from the lvm2app.h header file:
 //!  The API is designed around the following basic LVM objects:
 //!  1) Physical Volume (pv_t) 2) Volume Group (vg_t) 3) Logical Volume (lv_t).
 //!
@@ -30,16 +30,22 @@
 //!  the new one obtained with WRITE permission.
 
 extern crate errno;
+#[macro_use]
+extern crate log;
 extern crate lvm_sys;
+extern crate uuid;
 
 use std::error::Error as err;
 use std::ffi::{CStr, CString, NulError};
 use std::fmt;
 use std::io::Error as IOError;
+use std::path::Path;
 use std::ptr;
+use std::str::FromStr;
 
 use errno::Errno;
 use lvm_sys::*;
+use uuid::Uuid;
 
 pub type LvmResult<T> = Result<T, LvmError>;
 
@@ -49,6 +55,7 @@ pub enum LvmError {
     Error((Errno, String)),
     IoError(IOError),
     NulError(NulError),
+    ParseError(uuid::parser::ParseError),
 }
 
 impl fmt::Display for LvmError {
@@ -63,6 +70,7 @@ impl err for LvmError {
             LvmError::Error(ref e) => &e.1,
             LvmError::IoError(ref e) => e.description(),
             LvmError::NulError(ref e) => e.description(),
+            LvmError::ParseError(ref e) => e.description(),
         }
     }
     fn cause(&self) -> Option<&err> {
@@ -70,6 +78,7 @@ impl err for LvmError {
             LvmError::Error(_) => None,
             LvmError::IoError(ref e) => e.cause(),
             LvmError::NulError(ref e) => e.cause(),
+            LvmError::ParseError(ref e) => e.cause(),
         }
     }
 }
@@ -93,35 +102,10 @@ impl From<NulError> for LvmError {
     }
 }
 
-/*
-struct dm_list {
-    struct dm_list *n, 
-    struct dm_list *p,
-}
-
-struct lvm_str_list {
-    struct dm_list list;
-    const char *str;
-}
-*/
-
-macro_rules! dm_list_iterate {
-    ($v:ty, $head:expr) => {
-        let mut ptr: $v = (*$head).n;
-        while ptr.field != (*$head) {
-            //(t *)((v) - &((t *) 0)->head)
-        }
-        /* 
-        dm_list_iterate_items(v, head)
-        dm_list_iterate_items_gen(v, head, field) \
-        for (v = dm_list_struct_base((head)->n, __typeof__(*v), field); 
-             &v->field != (head); 
-             v = dm_list_struct_base(v->field.n, __typeof__(*v), field))
-
-        #define dm_list_struct_base(v, t, head) \
-            ((t *)((const char *)(v) - (const char *)&((t *) 0)->head))
-        */
-    } 
+impl From<uuid::parser::ParseError> for LvmError {
+    fn from(err: uuid::parser::ParseError) -> LvmError {
+        LvmError::ParseError(err)
+    }
 }
 
 #[derive(Debug)]
@@ -132,7 +116,72 @@ pub struct Lvm {
 impl Drop for Lvm {
     fn drop(&mut self) {
         unsafe {
-            lvm_quit(self.handle);
+            if !self.handle.is_null() {
+                debug!("dropping lvm");
+                lvm_quit(self.handle);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum OpenMode {
+    Read,
+    Write,
+}
+
+impl ToString for OpenMode {
+    fn to_string(&self) -> String {
+        match self {
+            OpenMode::Read => "r".into(),
+            OpenMode::Write => "w".into(),
+        }
+    }
+}
+
+/// Thin provisioning discard policies
+#[derive(Debug)]
+pub enum LvmThinPolicy {
+    Ignore,
+    NoPassdown,
+    Passdown,
+}
+
+impl ToString for LvmThinPolicy {
+    fn to_string(&self) -> String {
+        match self {
+            LvmThinPolicy::Ignore => "LVM_THIN_DISCARDS_IGNORE".into(),
+            LvmThinPolicy::NoPassdown => "LVM_THIN_DISCARDS_NO_PASSDOWN".into(),
+            LvmThinPolicy::Passdown => "LVM_THIN_DISCARDS_PASSDOWN".into(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum Property {
+    /// zero indicates use detected size of device
+    Size(u64),
+    /// Number of metadata copies (0,1,2)
+    PvMetaDataCopies(u8),
+    /// The approx. size to be to be set aside for metadata
+    PvMetaDatasize(u64),
+    /// Align the start of the data to a multiple of this number
+    DataAlignment(u64),
+    /// Shift the start of the data area by this addl. offset
+    DataAlignmentOffset(u64),
+    /// Set to true to zero out first 2048 bytes of device, false to not
+    Zero(bool),
+}
+
+impl ToString for Property {
+    fn to_string(&self) -> String {
+        match self {
+            Property::Size(_) => "size".into(),
+            Property::PvMetaDataCopies(_) => "pvmetadatacopies".into(),
+            Property::PvMetaDatasize(_) => "pvmetadatasize".into(),
+            Property::DataAlignment(_) => "data_alignment".into(),
+            Property::DataAlignmentOffset(_) => "".into(),
+            Property::Zero(_) => "zero".into(),
         }
     }
 }
@@ -146,22 +195,221 @@ pub struct VolumeGroup<'a> {
 impl<'a> Drop for VolumeGroup<'a> {
     fn drop(&mut self) {
         unsafe {
-            lvm_vg_close(self.handle);
+            if !self.handle.is_null() {
+                debug!("dropping vg");
+                lvm_vg_close(self.handle);
+            }
         }
     }
 }
 
 #[derive(Debug)]
-pub struct PhysicalVolume {
-    handle: pv_t,
+pub struct LvmPropertyValue {
+    pub is_settable: bool,
+    pub is_string: bool,
+    pub is_integer: bool,
+    pub is_signed: bool,
 }
 
 #[derive(Debug)]
-pub struct LogicalVolume {
+pub struct PhysicalVolume<'a> {
+    handle: pv_t,
+    lvm: &'a Lvm,
+}
+
+pub struct PhysicalVolumeCreateParameters<'a> {
+    handle: pv_create_params_t,
+    property_value: Option<lvm_property_value>,
+    lvm: &'a Lvm,
+}
+
+#[derive(Debug)]
+pub struct LogicalVolume<'b, 'a: 'b> {
     handle: lv_t,
+    lvm: &'a Lvm,
+    vg: &'b VolumeGroup<'b>,
+}
+
+impl<'a, 'b> LogicalVolume<'a, 'b> {
+    fn check_retcode(&self, retcode: i32) -> LvmResult<()> {
+        if retcode < 0 {
+            let err = self.lvm.get_error()?;
+            return Err(LvmError::new((err.0, err.1)));
+        }
+        Ok(())
+    }
+
+    /// Activate a logical volume
+    pub fn activate(&self) -> LvmResult<()> {
+        unsafe {
+            let retcode = lvm_lv_activate(self.handle);
+            self.check_retcode(retcode)?;
+            Ok(())
+        }
+    }
+
+    pub fn add_tag(&self, name: &str) -> LvmResult<()> {
+        let name = CString::new(name)?;
+        unsafe {
+            let retcode = lvm_lv_add_tag(self.handle, name.as_ptr());
+            self.check_retcode(retcode)?;
+            self.vg.write()?;
+            Ok(())
+        }
+    }
+
+    /// Deactivate a logical volume
+    pub fn deactivate(&self) -> LvmResult<()> {
+        unsafe {
+            let retcode = lvm_lv_deactivate(self.handle);
+            self.check_retcode(retcode)?;
+            Ok(())
+        }
+    }
+
+    /// Get the attributes of a logical volume
+    pub fn get_attributes(&self) -> String {
+        unsafe {
+            let ptr = lvm_lv_get_attr(self.handle);
+            let attrs_str = CStr::from_ptr(ptr).to_string_lossy();
+            attrs_str.into_owned()
+        }
+    }
+
+    /// Get the current name of a logical volume
+    pub fn get_name(&self) -> String {
+        unsafe {
+            let name = lvm_lv_get_name(self.handle);
+            let name_str = CStr::from_ptr(name).to_string_lossy();
+            name_str.into_owned()
+        }
+    }
+
+    pub fn get_origin(&self) -> Option<String> {
+        unsafe {
+            let ptr = lvm_lv_get_origin(self.handle);
+            if ptr.is_null() {
+                return None;
+            }
+            let origin = CStr::from_ptr(ptr).to_string_lossy();
+            Some(origin.into_owned())
+        }
+    }
+
+    /// Get the current size in bytes of a logical volume
+    pub fn get_size(&self) -> u64 {
+        unsafe { lvm_lv_get_size(self.handle) }
+    }
+
+    pub fn get_tags(&self) -> LvmResult<Vec<String>> {
+        let mut names: Vec<String> = vec![];
+        unsafe {
+            let tag_head = lvm_lv_get_tags(self.handle);
+            let mut tag = dm_list_first(tag_head);
+            loop {
+                if tag.is_null() {
+                    break;
+                }
+                let str_list = tag as *mut lvm_str_list;
+                let name = CStr::from_ptr((*str_list).str)
+                    .to_string_lossy()
+                    .into_owned();
+                names.push(name);
+                tag = dm_list_next(tag_head, tag);
+            }
+        }
+
+        Ok(names)
+    }
+
+    /// Get the current name of a logical volume
+    pub fn get_uuid(&self) -> LvmResult<Uuid> {
+        unsafe {
+            let uuid = lvm_lv_get_uuid(self.handle);
+            let name = CStr::from_ptr(uuid).to_string_lossy();
+            Ok(Uuid::from_str(&name)?)
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        unsafe {
+            let active = lvm_lv_is_active(self.handle);
+            active == 1
+        }
+    }
+
+    pub fn is_suspended(&self) -> bool {
+        unsafe {
+            let suspended = lvm_lv_is_suspended(self.handle);
+            suspended == 1
+        }
+    }
+
+    /// Remove a logical volume from a volume group
+    pub fn remove(&self) -> LvmResult<()> {
+        unsafe {
+            let retcode = lvm_vg_remove_lv(self.handle);
+            self.check_retcode(retcode)?;
+            Ok(())
+        }
+    }
+
+    pub fn remove_tag(&self, name: &str) -> LvmResult<()> {
+        let name = CString::new(name)?;
+        unsafe {
+            let retcode = lvm_lv_remove_tag(self.handle, name.as_ptr());
+            self.check_retcode(retcode)?;
+            self.vg.write()?;
+            Ok(())
+        }
+    }
+
+    pub fn rename(&self, new_name: &str) -> LvmResult<()> {
+        let new_name = CString::new(new_name)?;
+        unsafe {
+            let retcode = lvm_lv_rename(self.handle, new_name.as_ptr());
+            self.check_retcode(retcode)?;
+        }
+        Ok(())
+    }
+
+    /// Resize logical volume to new_size bytes
+    pub fn resize(&self, new_size: u64) -> LvmResult<()> {
+        unsafe {
+            let retcode = lvm_lv_resize(self.handle, new_size);
+            self.check_retcode(retcode)?;
+        }
+        Ok(())
+    }
+
+    /// Create a snapshot of a logical volume
+    /// Max snapshot space to use. If you pass zero the same amount of space
+    /// as the origin will be used
+    pub fn snapshot(&self, snap_name: &str, max_snap_size: u64) -> LvmResult<LogicalVolume> {
+        let snap_name = CString::new(snap_name)?;
+        unsafe {
+            let lv_t = lvm_lv_snapshot(self.handle, snap_name.as_ptr(), max_snap_size);
+            if lv_t.is_null() {}
+            Ok({
+                LogicalVolume {
+                    handle: lv_t,
+                    lvm: self.lvm,
+                    vg: self.vg,
+                }
+            })
+        }
+    }
 }
 
 impl Lvm {
+    fn check_retcode(&self, retcode: i32) -> LvmResult<()> {
+        if retcode < 0 {
+            let err = self.get_error()?;
+            return Err(LvmError::new((err.0, err.1)));
+        }
+        Ok(())
+    }
+
     fn get_error(&self) -> LvmResult<(Errno, String)> {
         let error = unsafe { lvm_errno(self.handle) };
         let msg = unsafe {
@@ -194,39 +442,592 @@ impl Lvm {
         }
     }
 
-    pub fn list_volume_groups(&self) -> LvmResult<Vec<String>> {
+    pub fn get_volume_group_names(&self) -> LvmResult<Vec<String>> {
         let mut names: Vec<String> = vec![];
         unsafe {
-            let mut vg_names = lvm_list_vg_names(self.handle);
-            //dm_list_iterate!(lvm_str_list_t, vg_names);
+            let vg_names = lvm_list_vg_names(self.handle);
+            let mut vg = dm_list_first(vg_names);
             loop {
-                println!("vg_names: {:p} vg_names.n:{:p} vg_names.p:{:p}", vg_names, (*vg_names).n, (*vg_names).p);
-                if (*vg_names).p == vg_names {
+                if vg.is_null() {
                     break;
                 }
-                let name = CStr::from_ptr((*vg_names).p as *const i8)
+                let str_list = vg as *mut lvm_str_list;
+                let name = CStr::from_ptr((*str_list).str)
                     .to_string_lossy()
                     .into_owned();
-                println!("name: {}", name);
                 names.push(name);
-                //if (*vg_names).n.is_null() {
-                    //break;
-                //}
-                vg_names = (*vg_names).n;
+                vg = dm_list_next(vg_names, vg);
             }
         }
 
         Ok(names)
     }
 
+    pub fn get_volume_group_uuids(&self) -> LvmResult<Vec<Uuid>> {
+        let mut ids: Vec<Uuid> = vec![];
+        unsafe {
+            let vg_uuids = lvm_list_vg_uuids(self.handle);
+            let mut vg = dm_list_first(vg_uuids);
+            loop {
+                if vg.is_null() {
+                    break;
+                }
+                let str_list = vg as *mut lvm_str_list;
+                let name = CStr::from_ptr((*str_list).str).to_string_lossy();
+                ids.push(Uuid::from_str(&name)?);
+                vg = dm_list_next(vg_uuids, vg);
+            }
+        }
+
+        Ok(ids)
+    }
+
+    pub fn pv_create(&self, name: &str, size: u64) -> LvmResult<()> {
+        let name = CString::new(name)?;
+        unsafe {
+            let retcode = lvm_pv_create(self.handle, name.as_ptr(), size);
+            self.check_retcode(retcode)?;
+        }
+        Ok(())
+    }
+
+    /// Remove a physical volume.
+    /// Note: You cannot remove a PV while iterating through the list of PVs as
+    /// locks are held for the PV list
+    pub fn pv_remove(&self, name: &str) -> LvmResult<()> {
+        let name = CString::new(name)?;
+        unsafe {
+            let retcode = lvm_pv_remove(self.handle, name.as_ptr());
+            self.check_retcode(retcode)?;
+        }
+        Ok(())
+    }
+
+    pub fn pv_create_params(&self, pv_name: &str) -> LvmResult<PhysicalVolumeCreateParameters> {
+        let name = CString::new(pv_name)?;
+        unsafe {
+            let pv_params = lvm_pv_params_create(self.handle, name.as_ptr());
+            if pv_params.is_null() {
+                let err = self.get_error()?;
+                return Err(LvmError::new((err.0, err.1)));
+            }
+            Ok(PhysicalVolumeCreateParameters {
+                handle: pv_params,
+                property_value: None,
+                lvm: &self,
+            })
+        }
+    }
+
     /// Scan all devices on the system for VGs and LVM metadata
     pub fn scan(&self) -> LvmResult<()> {
         unsafe {
             let retcode = lvm_scan(self.handle);
-            if retcode < 0 {
+            self.check_retcode(retcode)?;
+        }
+        Ok(())
+    }
+
+    ///Return the volume group name given a device name
+    pub fn vg_name_from_device(&self, device: &str) -> LvmResult<Option<String>> {
+        let device = CString::new(device)?;
+        unsafe {
+            let id = lvm_vgname_from_device(self.handle, device.as_ptr());
+            if id.is_null() {
+                return Ok(None);
+            }
+            let name = CStr::from_ptr(id).to_string_lossy().into_owned();
+            Ok(Some(name))
+        }
+    }
+
+    /// Return the volume group name given a PV UUID
+    pub fn vg_name_from_pvid(&self, pvid: &Uuid) -> LvmResult<Option<String>> {
+        let pvid = CString::new(pvid.as_bytes().to_vec())?;
+        unsafe {
+            let id = lvm_vgname_from_pvid(self.handle, pvid.as_ptr());
+            if id.is_null() {
+                return Ok(None);
+            }
+            let name = CStr::from_ptr(id).to_string_lossy().into_owned();
+            Ok(Some(name))
+        }
+    }
+    ///  This function checks that the name has no invalid characters,
+    /// the length doesn't exceed maximum and that the VG name isn't already in use
+    /// and that the name adheres to any other limitations.
+    pub fn vg_name_validate(&self, name: &str) -> LvmResult<()> {
+        let name = CString::new(name)?;
+        unsafe {
+            let retcode = lvm_vg_name_validate(self.handle, name.as_ptr());
+            self.check_retcode(retcode)?;
+        }
+        Ok(())
+    }
+
+    /// Create a VG with default parameters.
+    /// This function creates a Volume Group object in memory.
+    /// Once all parameters are set appropriately and all devices are added to the
+    /// VG, use lvm_vg_write() to commit the new VG to disk, and lvm_vg_close() to
+    /// release the VG handle.
+    pub fn vg_create(&self, name: &str) -> LvmResult<VolumeGroup> {
+        let name = CString::new(name)?;
+        unsafe {
+            let vg_t = lvm_vg_create(self.handle, name.as_ptr());
+            if vg_t.is_null() {
                 let err = self.get_error()?;
                 return Err(LvmError::new((err.0, err.1)));
             }
+            Ok(VolumeGroup {
+                handle: vg_t,
+                lvm: &self,
+            })
+        }
+    }
+
+    pub fn vg_open(&self, name: &str, mode: &OpenMode) -> LvmResult<VolumeGroup> {
+        let name = CString::new(name)?;
+        let mode = CString::new(mode.to_string())?;
+        unsafe {
+            let vg_handle = lvm_vg_open(self.handle, name.as_ptr(), mode.as_ptr(), 0);
+            if vg_handle.is_null() {
+                let err = self.get_error()?;
+                return Err(LvmError::new((err.0, err.1)));
+            }
+            Ok(VolumeGroup {
+                handle: vg_handle,
+                lvm: &self,
+            })
+        }
+    }
+}
+
+impl<'a> PhysicalVolumeCreateParameters<'a> {
+    /// Create a parameter object to use in function lvm_pv_create_adv
+    pub fn get_property(&mut self, name: &Property) -> LvmResult<()> {
+        let name = CString::new(name.to_string())?;
+        unsafe {
+            let property_value = lvm_pv_params_get_property(self.handle, name.as_ptr());
+            self.property_value = Some(property_value);
+        }
+        Ok(())
+    }
+
+    pub fn set_property(&mut self, name: &Property) -> LvmResult<()> {
+        let name = CString::new(name.to_string())?;
+        unsafe {
+            let retcode = lvm_pv_params_set_property(
+                self.handle,
+                name.as_ptr(),
+                &mut self.property_value.unwrap(),
+            );
+            if retcode < 0 {
+                let err = self.lvm.get_error()?;
+                return Err(LvmError::new((err.0, err.1)));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'a> PhysicalVolume<'a> {
+    fn check_retcode(&self, retcode: i32) -> LvmResult<()> {
+        if retcode < 0 {
+            let err = self.lvm.get_error()?;
+            return Err(LvmError::new((err.0, err.1)));
+        }
+        Ok(())
+    }
+
+    /// Get the current size in bytes of a device underlying a
+    /// physical volume
+    pub fn get_dev_size(&self) -> u64 {
+        unsafe { lvm_pv_get_dev_size(self.handle) }
+    }
+
+    /// Get the current unallocated space in bytes of a physical volume
+    pub fn get_free(&self) -> u64 {
+        unsafe { lvm_pv_get_free(self.handle) }
+    }
+
+    /// Get the current number of metadata areas in the physical volume
+    pub fn get_mda_count(&self) -> u64 {
+        unsafe { lvm_pv_get_mda_count(self.handle) }
+    }
+
+    /// Get the current name of a physical volume
+    pub fn get_name(&self) -> String {
+        unsafe {
+            let name = lvm_pv_get_name(self.handle);
+            CStr::from_ptr(name).to_string_lossy().into_owned()
+        }
+    }
+
+    /// Get the current size in bytes of a physical volume
+    pub fn get_size(&self) -> u64 {
+        unsafe { lvm_pv_get_size(self.handle) }
+    }
+
+    /*
+    pub fn get_property(&self, name: &str) -> LvmResult<PhysicalVolumeCreateParameters> {
+        let name = CString::new(name)?;
+        unsafe {
+            let val = lvm_pv_get_property(self.handle, name.as_ptr());
+            if val.is_valid() != 0 {
+                let err = self.lvm.get_error()?;
+                return Err(LvmError::new((err.0, err.1)));
+            }
+            Ok(PhysicalVolumeCreateParameters {})
+        }
+    }
+    */
+
+    pub fn get_uuid(&self) -> LvmResult<Uuid> {
+        unsafe {
+            let id = lvm_pv_get_uuid(self.handle);
+            let tmp = CStr::from_ptr(id).to_string_lossy();
+            Ok(Uuid::from_str(&tmp)?)
+        }
+    }
+
+    pub fn resize(&self, new_size: u64) -> LvmResult<()> {
+        unsafe {
+            let retcode = lvm_pv_resize(self.handle, new_size);
+            self.check_retcode(retcode)?;
+        }
+        Ok(())
+    }
+}
+
+impl<'a> VolumeGroup<'a> {
+    /// Add a tag to a VG
+    pub fn add_tag(&self, tag: &str) -> LvmResult<()> {
+        let tag = CString::new(tag)?;
+        unsafe {
+            let retcode = lvm_vg_add_tag(self.handle, tag.as_ptr());
+            self.check_retcode(retcode)?;
+        }
+        self.write()?;
+        Ok(())
+    }
+
+    fn check_retcode(&self, retcode: i32) -> LvmResult<()> {
+        if retcode < 0 {
+            let err = self.lvm.get_error()?;
+            return Err(LvmError::new((err.0, err.1)));
+        }
+        Ok(())
+    }
+
+    /// Close a VG
+    pub fn close(&self) -> LvmResult<()> {
+        unsafe {
+            let retcode = lvm_vg_close(self.handle);
+            self.check_retcode(retcode)?;
+        }
+        Ok(())
+    }
+
+    /// Return a list of LV handles for a given VG handle
+    pub fn list_lvs(&self) -> LvmResult<Vec<String>> {
+        Ok(vec![])
+    }
+
+    /// Return a list of PV handles for all
+    pub fn list_pvs(&self) -> LvmResult<Vec<String>> {
+        Ok(vec![])
+    }
+
+    /// Create a linear logical volume
+    pub fn create_lv_linear(&self, name: &str, size: u64) -> LvmResult<LogicalVolume> {
+        let name = CString::new(name)?;
+        unsafe {
+            let lv_t = lvm_vg_create_lv_linear(self.handle, name.as_ptr(), size);
+            if lv_t.is_null() {
+                let err = self.lvm.get_error()?;
+                return Err(LvmError::new((err.0, err.1)));
+            }
+            Ok(LogicalVolume {
+                handle: lv_t,
+                lvm: self.lvm,
+                vg: self,
+            })
+        }
+    }
+
+    /// Create a thinpool parameter passing object for the specified VG
+    /// \param   chunk_size
+    /// data block size of the pool
+    /// Default value is DEFAULT_THIN_POOL_CHUNK_SIZE * 2 when 0 passed as chunk_size
+    /// DM_THIN_MIN_DATA_BLOCK_SIZE < chunk_size < DM_THIN_MAX_DATA_BLOCK_SIZE
+    ///
+    /// \param meta_size
+    /// Size of thin pool's metadata logical volume. Allowed range is 2MB-16GB.
+    /// Default value (ie if 0) pool size / pool chunk size * 64
+    ///
+    /// Note: Passdown discard policy is the default.
+    pub fn create_thin_pool(
+        &self,
+        pool_name: &str,
+        size: u64,
+        chunk_size: u32,
+        metadata_size: u64,
+        discard_policy: &LvmThinPolicy,
+    ) -> LvmResult<()> {
+        let pool_name = CString::new(pool_name)?;
+        let discard = match discard_policy {
+            LvmThinPolicy::Ignore => lvm_thin_discards_t_LVM_THIN_DISCARDS_IGNORE,
+            LvmThinPolicy::NoPassdown => lvm_thin_discards_t_LVM_THIN_DISCARDS_NO_PASSDOWN,
+            LvmThinPolicy::Passdown => lvm_thin_discards_t_LVM_THIN_DISCARDS_PASSDOWN,
+        };
+        unsafe {
+            let create_params = lvm_lv_params_create_thin_pool(
+                self.handle,
+                pool_name.as_ptr(),
+                size,
+                chunk_size,
+                metadata_size,
+                discard,
+            );
+            if create_params.is_null() {
+                let err = self.lvm.get_error()?;
+                return Err(LvmError::new((err.0, err.1)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Extend a VG by adding a device
+    pub fn extend(&self, device: &Path) -> LvmResult<()> {
+        let dev = CString::new(device.to_string_lossy().as_bytes())?;
+        unsafe {
+            let retcode = lvm_vg_extend(self.handle, dev.as_ptr());
+            self.check_retcode(retcode)?;
+        }
+        self.write()?;
+        Ok(())
+    }
+
+    /// Get the current metadata sequence number of a volume group.
+    /// The metadata sequence number is incrented for each metadata change.
+    /// Applications may use the sequence number to determine if any LVM objects
+    /// have changed from a prior query.
+    pub fn get_seq_number(&self) -> u64 {
+        unsafe { lvm_vg_get_seqno(self.handle) }
+    }
+
+    /// Get the current name of a volume group
+    pub fn get_name(&self) -> LvmResult<String> {
+        unsafe {
+            let uid = lvm_vg_get_name(self.handle);
+            let tmp = CStr::from_ptr(uid).to_string_lossy();
+
+            Ok(tmp.into_owned())
+        }
+    }
+
+    /// Get the current number of total extents of a volume group
+    pub fn get_extent_count(&self) -> u64 {
+        unsafe { lvm_vg_get_extent_count(self.handle) }
+    }
+
+    /// Get the current extent size in bytes of a volume group
+    pub fn get_extent_size(&self) -> u64 {
+        unsafe { lvm_vg_get_extent_size(self.handle) }
+    }
+
+    /// Get the current number of free extents of a volume group
+    pub fn get_free_extents(&self) -> u64 {
+        unsafe { lvm_vg_get_free_extent_count(self.handle) }
+    }
+
+    /// Get the current unallocated space in bytes of a volume group
+    pub fn get_free_size(&self) -> u64 {
+        unsafe { lvm_vg_get_free_size(self.handle) }
+    }
+
+    /// Get the maximum number of logical volumes allowed in a volume group
+    pub fn get_max_lv(&self) -> u64 {
+        unsafe { lvm_vg_get_max_lv(self.handle) }
+    }
+
+    /// Get the maximum number of physical volumes allowed in a volume group
+    pub fn get_max_pv(&self) -> u64 {
+        unsafe { lvm_vg_get_max_pv(self.handle) }
+    }
+
+    /// Get the current number of physical volumes of a volume group
+    pub fn get_pv_count(&self) -> u64 {
+        unsafe { lvm_vg_get_pv_count(self.handle) }
+    }
+
+    /// Get the current size in bytes of a volume group
+    pub fn get_size(&self) -> u64 {
+        unsafe { lvm_vg_get_size(self.handle) }
+    }
+
+    pub fn get_tags(&self) -> LvmResult<Vec<String>> {
+        let mut names: Vec<String> = vec![];
+        unsafe {
+            let tag_head = lvm_vg_get_tags(self.handle);
+            let mut tag = dm_list_first(tag_head);
+            loop {
+                if tag.is_null() {
+                    break;
+                }
+                let str_list = tag as *mut lvm_str_list;
+                let name = CStr::from_ptr((*str_list).str)
+                    .to_string_lossy()
+                    .into_owned();
+                names.push(name);
+                tag = dm_list_next(tag_head, tag);
+            }
+        }
+
+        Ok(names)
+    }
+
+    /// Get the current uuid of a volume group
+    pub fn get_uuid(&self) -> LvmResult<Uuid> {
+        unsafe {
+            let uid = lvm_vg_get_uuid(self.handle);
+            let tmp = CStr::from_ptr(uid).to_string_lossy();
+
+            Ok(Uuid::from_str(&tmp)?)
+        }
+    }
+
+    /// Get whether or not a volume group is clustered
+    pub fn is_clustered(&self) -> bool {
+        unsafe {
+            let clustered = lvm_vg_is_clustered(self.handle);
+            clustered == 1
+        }
+    }
+
+    /// Get whether or not a volume group is exported
+    pub fn is_exported(&self) -> bool {
+        unsafe {
+            let exported = lvm_vg_is_exported(self.handle);
+            exported == 1
+        }
+    }
+    /// Get whether or not a volume group is a partial volume group.
+    /// When one or more physical volumes belonging to the volume group
+    /// are missing from the system the volume group is a partial volume
+    ///  group.
+    pub fn is_partial(&self) -> bool {
+        unsafe {
+            let partial = lvm_vg_is_partial(self.handle);
+            partial == 1
+        }
+    }
+
+    pub fn lv_from_name(&self, name: &str) -> LvmResult<LogicalVolume> {
+        let name = CString::new(name)?;
+        unsafe {
+            let lv_t = lvm_lv_from_name(self.handle, name.as_ptr());
+            if lv_t.is_null() {
+                let err = self.lvm.get_error()?;
+                return Err(LvmError::new((err.0, err.1)));
+            }
+            Ok(LogicalVolume {
+                handle: lv_t,
+                lvm: self.lvm,
+                vg: self,
+            })
+        }
+    }
+
+    /// Validate a name to be used for LV creation
+    /// Validates that the name does not contain any invalid characters,
+    /// max length and that the LV name doesn't already exist for this VG
+    pub fn name_validate(&self, name: &str) -> LvmResult<()> {
+        let name = CString::new(name)?;
+        unsafe {
+            let retcode = lvm_lv_name_validate(self.handle, name.as_ptr());
+            self.check_retcode(retcode)?;
+        }
+        Ok(())
+    }
+
+    /// Lookup an PV handle in a VG by the PV name.
+    pub fn pv_from_name(&self, name: &str) -> LvmResult<PhysicalVolume> {
+        let name = CString::new(name)?;
+        unsafe {
+            let pv_t = lvm_pv_from_name(self.handle, name.as_ptr());
+            if pv_t.is_null() {
+                let err = self.lvm.get_error()?;
+                return Err(LvmError::new((err.0, err.1)));
+            }
+            Ok(PhysicalVolume {
+                handle: pv_t,
+                lvm: self.lvm,
+            })
+        }
+    }
+
+    /// Lookup an PV handle in a VG by the PV uuid
+    pub fn pv_from_uuid(&self, id: &Uuid) -> LvmResult<PhysicalVolume> {
+        let id = CString::new(id.as_bytes().to_vec())?;
+        unsafe {
+            let pv_t = lvm_pv_from_uuid(self.handle, id.as_ptr());
+            if pv_t.is_null() {
+                let err = self.lvm.get_error()?;
+                return Err(LvmError::new((err.0, err.1)));
+            }
+            Ok(PhysicalVolume {
+                handle: pv_t,
+                lvm: self.lvm,
+            })
+        }
+    }
+
+    /// Reduce a VG by removing an unused device.
+    pub fn reduce(&self, device: &str) -> LvmResult<()> {
+        let dev = CString::new(device)?;
+        unsafe {
+            let retcode = lvm_vg_reduce(self.handle, dev.as_ptr());
+            self.check_retcode(retcode)?;
+        }
+        Ok(())
+    }
+
+    /// Remove a VG from the system.
+    pub fn remove(&self) -> LvmResult<()> {
+        unsafe {
+            let retcode = lvm_vg_remove(self.handle);
+            self.check_retcode(retcode)?;
+        }
+        self.write()?;
+        Ok(())
+    }
+
+    /// Remove a tag to a VG
+    pub fn remove_tag(&self, tag: &str) -> LvmResult<()> {
+        let tag = CString::new(tag)?;
+        unsafe {
+            let retcode = lvm_vg_remove_tag(self.handle, tag.as_ptr());
+            self.check_retcode(retcode)?;
+        }
+        self.write()?;
+        Ok(())
+    }
+
+    pub fn set_extent_size(&self, size: u32) -> LvmResult<()> {
+        unsafe {
+            let retcode = lvm_vg_set_extent_size(self.handle, size);
+            self.check_retcode(retcode)?;
+        }
+        self.write()?;
+        Ok(())
+    }
+
+    /// Write a VG to disk
+    pub fn write(&self) -> LvmResult<()> {
+        unsafe {
+            let retcode = lvm_vg_write(self.handle);
+            self.check_retcode(retcode)?;
         }
         Ok(())
     }

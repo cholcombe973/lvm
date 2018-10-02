@@ -2,7 +2,10 @@
 name = "lvm"
 version = "0.1.0"
 authors = ["Chris Holcombe <xfactor973@gmail.com>"]
+license = "MIT"
 
 [dependencies]
-errno = "*"
-lvm-sys = {git = "https://github.com/cholcombe973/lvm-sys"}
+errno = "~0.2"
+log = "~0.4"
+lvm-sys = "*"
+uuid = "~0.7"
