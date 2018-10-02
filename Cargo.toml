@@ -10,5 +10,5 @@ catagories = ["api-bindings"]
 [dependencies]
 errno = "~0.2"
 log = "~0.4"
-lvm-sys = "*"
+lvm-sys = "~0.1"
 uuid = "~0.7"
