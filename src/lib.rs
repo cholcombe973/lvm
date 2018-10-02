@@ -134,6 +134,24 @@ impl ToString for OpenMode {
     }
 }
 
+/// Thin provisioning discard policies
+#[derive(Debug)]
+pub enum LvmThinPolicy {
+    Ignore,
+    NoPassdown,
+    Passdown,
+}
+
+impl ToString for LvmThinPolicy {
+    fn to_string(&self) -> String {
+        match self {
+            LvmThinPolicy::Ignore => "LVM_THIN_DISCARDS_IGNORE".into(),
+            LvmThinPolicy::NoPassdown => "LVM_THIN_DISCARDS_NO_PASSDOWN".into(),
+            LvmThinPolicy::Passdown => "LVM_THIN_DISCARDS_PASSDOWN".into(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum Property {
     /// zero indicates use detected size of device
@@ -186,8 +204,9 @@ pub struct LvmPropertyValue {
 }
 
 #[derive(Debug)]
-pub struct PhysicalVolume {
+pub struct PhysicalVolume<'a> {
     handle: pv_t,
+    lvm: &'a Lvm,
 }
 
 pub struct PhysicalVolumeCreateParameters<'a> {
@@ -197,14 +216,14 @@ pub struct PhysicalVolumeCreateParameters<'a> {
 }
 
 #[derive(Debug)]
-pub struct LogicalVolume<'a: 'b > {
+pub struct LogicalVolume<'b, 'a: 'b> {
     handle: lv_t,
     lvm: &'a Lvm,
-    vg: &'b VolumeGroup,
+    vg: &'b VolumeGroup<'b>,
 }
 
-impl LogicalVolume {
-  fn check_retcode(&self, retcode: i32) -> LvmResult<()> {
+impl<'a, 'b> LogicalVolume<'a, 'b> {
+    fn check_retcode(&self, retcode: i32) -> LvmResult<()> {
         if retcode < 0 {
             let err = self.lvm.get_error()?;
             return Err(LvmError::new((err.0, err.1)));
@@ -222,8 +241,9 @@ impl LogicalVolume {
     }
 
     pub fn add_tag(&self, name: &str) -> LvmResult<()> {
+        let name = CString::new(name)?;
         unsafe {
-            let retcode = lvm_lv_add_tag(self.handle);
+            let retcode = lvm_lv_add_tag(self.handle, name.as_ptr());
             self.check_retcode(retcode)?;
             self.vg.write()?;
             Ok(())
@@ -242,18 +262,18 @@ impl LogicalVolume {
     /// Get the attributes of a logical volume
     pub fn get_attributes(&self) -> String {
         unsafe {
-            let ptr = lvm_lv_get_attr}(self.handle);
-            let attrs = CStr::from_ptr(ptr).to_string_lossy();
-            Ok(attrs)
+            let ptr = lvm_lv_get_attr(self.handle);
+            let attrs_str = CStr::from_ptr(ptr).to_string_lossy();
+            attrs_str.into_owned()
         }
     }
 
     /// Get the current name of a logical volume
     pub fn get_name(&self) -> String {
-        unsafe{
+        unsafe {
             let name = lvm_lv_get_name(self.handle);
-            let name = CStr::from_ptr(name).to_string_lossy();
-            Ok(name)
+            let name_str = CStr::from_ptr(name).to_string_lossy();
+            name_str.into_owned()
         }
     }
 
@@ -264,15 +284,34 @@ impl LogicalVolume {
                 return None;
             }
             let origin = CStr::from_ptr(ptr).to_string_lossy();
-            Some(origin)
+            Some(origin.into_owned())
         }
     }
 
     /// Get the current size in bytes of a logical volume
     pub fn get_size(&self) -> u64 {
+        unsafe { lvm_lv_get_size(self.handle) }
+    }
+
+    pub fn get_tags(&self) -> LvmResult<Vec<String>> {
+        let mut names: Vec<String> = vec![];
         unsafe {
-            lvm_lv_get_size(self.handle)
+            let tag_head = lvm_lv_get_tags(self.handle);
+            let mut tag = dm_list_first(tag_head);
+            loop {
+                if tag.is_null() {
+                    break;
+                }
+                let str_list = tag as *mut lvm_str_list;
+                let name = CStr::from_ptr((*str_list).str)
+                    .to_string_lossy()
+                    .into_owned();
+                names.push(name);
+                tag = dm_list_next(tag_head, tag);
+            }
         }
+
+        Ok(names)
     }
 
     /// Get the current name of a logical volume
@@ -280,7 +319,7 @@ impl LogicalVolume {
         unsafe {
             let uuid = lvm_lv_get_uuid(self.handle);
             let name = CStr::from_ptr(uuid).to_string_lossy();
-            ids.push(Uuid::from_str(&name)?);
+            Ok(Uuid::from_str(&name)?)
         }
     }
 
@@ -308,14 +347,50 @@ impl LogicalVolume {
     }
 
     pub fn remove_tag(&self, name: &str) -> LvmResult<()> {
+        let name = CString::new(name)?;
         unsafe {
-            let retcode = lvm_lv_remove_tag(self.handle);
+            let retcode = lvm_lv_remove_tag(self.handle, name.as_ptr());
             self.check_retcode(retcode)?;
             self.vg.write()?;
             Ok(())
         }
     }
 
+    pub fn rename(&self, new_name: &str) -> LvmResult<()> {
+        let new_name = CString::new(new_name)?;
+        unsafe {
+            let retcode = lvm_lv_rename(self.handle, new_name.as_ptr());
+            self.check_retcode(retcode)?;
+        }
+        Ok(())
+    }
+
+    /// Resize logical volume to new_size bytes
+    pub fn resize(&self, new_size: u64) -> LvmResult<()> {
+        unsafe {
+            let retcode = lvm_lv_resize(self.handle, new_size);
+            self.check_retcode(retcode)?;
+        }
+        Ok(())
+    }
+
+    /// Create a snapshot of a logical volume
+    /// Max snapshot space to use. If you pass zero the same amount of space
+    /// as the origin will be used
+    pub fn snapshot(&self, snap_name: &str, max_snap_size: u64) -> LvmResult<LogicalVolume> {
+        let snap_name = CString::new(snap_name)?;
+        unsafe {
+            let lv_t = lvm_lv_snapshot(self.handle, snap_name.as_ptr(), max_snap_size);
+            if lv_t.is_null() {}
+            Ok({
+                LogicalVolume {
+                    handle: lv_t,
+                    lvm: self.lvm,
+                    vg: self.vg,
+                }
+            })
+        }
+    }
 }
 
 impl Lvm {
@@ -547,17 +622,76 @@ impl<'a> PhysicalVolumeCreateParameters<'a> {
     }
 }
 
+impl<'a> PhysicalVolume<'a> {
+    fn check_retcode(&self, retcode: i32) -> LvmResult<()> {
+        if retcode < 0 {
+            let err = self.lvm.get_error()?;
+            return Err(LvmError::new((err.0, err.1)));
+        }
+        Ok(())
+    }
+
+    /// Get the current size in bytes of a device underlying a
+    /// physical volume
+    pub fn get_dev_size(&self) -> u64 {
+        unsafe { lvm_pv_get_dev_size(self.handle) }
+    }
+
+    /// Get the current unallocated space in bytes of a physical volume
+    pub fn get_free(&self) -> u64 {
+        unsafe { lvm_pv_get_free(self.handle) }
+    }
+
+    /// Get the current number of metadata areas in the physical volume
+    pub fn get_mda_count(&self) -> u64 {
+        unsafe { lvm_pv_get_mda_count(self.handle) }
+    }
+
+    /// Get the current name of a physical volume
+    pub fn get_name(&self) -> String {
+        unsafe {
+            let name = lvm_pv_get_name(self.handle);
+            CStr::from_ptr(name).to_string_lossy().into_owned()
+        }
+    }
+
+    /// Get the current size in bytes of a physical volume
+    pub fn get_size(&self) -> u64 {
+        unsafe { lvm_pv_get_size(self.handle) }
+    }
+
+    /*
+    pub fn get_property(&self, name: &str) -> LvmResult<PhysicalVolumeCreateParameters> {
+        let name = CString::new(name)?;
+        unsafe {
+            let val = lvm_pv_get_property(self.handle, name.as_ptr());
+            if val.is_valid() != 0 {
+                let err = self.lvm.get_error()?;
+                return Err(LvmError::new((err.0, err.1)));
+            }
+            Ok(PhysicalVolumeCreateParameters {})
+        }
+    }
+    */
+
+    pub fn get_uuid(&self) -> LvmResult<Uuid> {
+        unsafe {
+            let id = lvm_pv_get_uuid(self.handle);
+            let tmp = CStr::from_ptr(id).to_string_lossy();
+            Ok(Uuid::from_str(&tmp)?)
+        }
+    }
+
+    pub fn resize(&self, new_size: u64) -> LvmResult<()> {
+        unsafe {
+            let retcode = lvm_pv_resize(self.handle, new_size);
+            self.check_retcode(retcode)?;
+        }
+        Ok(())
+    }
+}
+
 impl<'a> VolumeGroup<'a> {
-    /// Return a list of LV handles for a given VG handle
-    pub fn list_lvs(&self) -> LvmResult<Vec<String>> {
-        Ok(vec![])
-    }
-
-    /// Return a list of PV handles for all
-    pub fn list_pvs(&self) -> LvmResult<Vec<String>> {
-        Ok(vec![])
-    }
-
     /// Add a tag to a VG
     pub fn add_tag(&self, tag: &str) -> LvmResult<()> {
         let tag = CString::new(tag)?;
@@ -586,6 +720,16 @@ impl<'a> VolumeGroup<'a> {
         Ok(())
     }
 
+    /// Return a list of LV handles for a given VG handle
+    pub fn list_lvs(&self) -> LvmResult<Vec<String>> {
+        Ok(vec![])
+    }
+
+    /// Return a list of PV handles for all
+    pub fn list_pvs(&self) -> LvmResult<Vec<String>> {
+        Ok(vec![])
+    }
+
     /// Create a linear logical volume
     pub fn create_lv_linear(&self, name: &str, size: u64) -> LvmResult<LogicalVolume> {
         let name = CString::new(name)?;
@@ -595,8 +739,54 @@ impl<'a> VolumeGroup<'a> {
                 let err = self.lvm.get_error()?;
                 return Err(LvmError::new((err.0, err.1)));
             }
-            Ok(LogicalVolume { handle: lv_t })
+            Ok(LogicalVolume {
+                handle: lv_t,
+                lvm: self.lvm,
+                vg: self,
+            })
         }
+    }
+
+    /// Create a thinpool parameter passing object for the specified VG
+    /// \param   chunk_size
+    /// data block size of the pool
+    /// Default value is DEFAULT_THIN_POOL_CHUNK_SIZE * 2 when 0 passed as chunk_size
+    /// DM_THIN_MIN_DATA_BLOCK_SIZE < chunk_size < DM_THIN_MAX_DATA_BLOCK_SIZE
+    ///
+    /// \param meta_size
+    /// Size of thin pool's metadata logical volume. Allowed range is 2MB-16GB.
+    /// Default value (ie if 0) pool size / pool chunk size * 64
+    ///
+    /// Note: Passdown discard policy is the default.
+    pub fn create_thin_pool(
+        &self,
+        pool_name: &str,
+        size: u64,
+        chunk_size: u32,
+        metadata_size: u64,
+        discard_policy: &LvmThinPolicy,
+    ) -> LvmResult<()> {
+        let pool_name = CString::new(pool_name)?;
+        let discard = match discard_policy {
+            LvmThinPolicy::Ignore => lvm_thin_discards_t_LVM_THIN_DISCARDS_IGNORE,
+            LvmThinPolicy::NoPassdown => lvm_thin_discards_t_LVM_THIN_DISCARDS_NO_PASSDOWN,
+            LvmThinPolicy::Passdown => lvm_thin_discards_t_LVM_THIN_DISCARDS_PASSDOWN,
+        };
+        unsafe {
+            let create_params = lvm_lv_params_create_thin_pool(
+                self.handle,
+                pool_name.as_ptr(),
+                size,
+                chunk_size,
+                metadata_size,
+                discard,
+            );
+            if create_params.is_null() {
+                let err = self.lvm.get_error()?;
+                return Err(LvmError::new((err.0, err.1)));
+            }
+        }
+        Ok(())
     }
 
     /// Extend a VG by adding a device
@@ -733,7 +923,55 @@ impl<'a> VolumeGroup<'a> {
                 let err = self.lvm.get_error()?;
                 return Err(LvmError::new((err.0, err.1)));
             }
-            Ok(LogicalVolume { handle: lv_t })
+            Ok(LogicalVolume {
+                handle: lv_t,
+                lvm: self.lvm,
+                vg: self,
+            })
+        }
+    }
+
+    /// Validate a name to be used for LV creation
+    /// Validates that the name does not contain any invalid characters,
+    /// max length and that the LV name doesn't already exist for this VG
+    pub fn name_validate(&self, name: &str) -> LvmResult<()> {
+        let name = CString::new(name)?;
+        unsafe {
+            let retcode = lvm_lv_name_validate(self.handle, name.as_ptr());
+            self.check_retcode(retcode)?;
+        }
+        Ok(())
+    }
+
+    /// Lookup an PV handle in a VG by the PV name.
+    pub fn pv_from_name(&self, name: &str) -> LvmResult<PhysicalVolume> {
+        let name = CString::new(name)?;
+        unsafe {
+            let pv_t = lvm_pv_from_name(self.handle, name.as_ptr());
+            if pv_t.is_null() {
+                let err = self.lvm.get_error()?;
+                return Err(LvmError::new((err.0, err.1)));
+            }
+            Ok(PhysicalVolume {
+                handle: pv_t,
+                lvm: self.lvm,
+            })
+        }
+    }
+
+    /// Lookup an PV handle in a VG by the PV uuid
+    pub fn pv_from_uuid(&self, id: &Uuid) -> LvmResult<PhysicalVolume> {
+        let id = CString::new(id.as_bytes().to_vec())?;
+        unsafe {
+            let pv_t = lvm_pv_from_uuid(self.handle, id.as_ptr());
+            if pv_t.is_null() {
+                let err = self.lvm.get_error()?;
+                return Err(LvmError::new((err.0, err.1)));
+            }
+            Ok(PhysicalVolume {
+                handle: pv_t,
+                lvm: self.lvm,
+            })
         }
     }
 
