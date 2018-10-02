@@ -1,0 +1,18 @@
+language: rust
+dist: trusty
+rust:
+  - stable
+  - beta
+matrix:
+  allow_failures:
+    - rust: beta
+  fast_finish: true
+cache: cargo
+addons:
+  apt:
+    packages:
+      - liblvm2-dev
+      - pkg-config
+      - make
+script:
+  - cargo build --verbose --all
