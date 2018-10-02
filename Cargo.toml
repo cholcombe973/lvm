@@ -1,8 +1,11 @@
 [package]
 name = "lvm"
+description = "LVM safe bindings"
+homepage = "https://github.com/cholcombe973/lvm"
 version = "0.1.0"
 authors = ["Chris Holcombe <xfactor973@gmail.com>"]
 license = "MIT"
+catagories = ["api-bindings"]
 
 [dependencies]
 errno = "~0.2"
