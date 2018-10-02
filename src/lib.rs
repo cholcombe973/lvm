@@ -197,11 +197,126 @@ pub struct PhysicalVolumeCreateParameters<'a> {
 }
 
 #[derive(Debug)]
-pub struct LogicalVolume {
+pub struct LogicalVolume<'a: 'b > {
     handle: lv_t,
+    lvm: &'a Lvm,
+    vg: &'b VolumeGroup,
 }
 
-impl LogicalVolume {}
+impl LogicalVolume {
+  fn check_retcode(&self, retcode: i32) -> LvmResult<()> {
+        if retcode < 0 {
+            let err = self.lvm.get_error()?;
+            return Err(LvmError::new((err.0, err.1)));
+        }
+        Ok(())
+    }
+
+    /// Activate a logical volume
+    pub fn activate(&self) -> LvmResult<()> {
+        unsafe {
+            let retcode = lvm_lv_activate(self.handle);
+            self.check_retcode(retcode)?;
+            Ok(())
+        }
+    }
+
+    pub fn add_tag(&self, name: &str) -> LvmResult<()> {
+        unsafe {
+            let retcode = lvm_lv_add_tag(self.handle);
+            self.check_retcode(retcode)?;
+            self.vg.write()?;
+            Ok(())
+        }
+    }
+
+    /// Deactivate a logical volume
+    pub fn deactivate(&self) -> LvmResult<()> {
+        unsafe {
+            let retcode = lvm_lv_deactivate(self.handle);
+            self.check_retcode(retcode)?;
+            Ok(())
+        }
+    }
+
+    /// Get the attributes of a logical volume
+    pub fn get_attributes(&self) -> String {
+        unsafe {
+            let ptr = lvm_lv_get_attr}(self.handle);
+            let attrs = CStr::from_ptr(ptr).to_string_lossy();
+            Ok(attrs)
+        }
+    }
+
+    /// Get the current name of a logical volume
+    pub fn get_name(&self) -> String {
+        unsafe{
+            let name = lvm_lv_get_name(self.handle);
+            let name = CStr::from_ptr(name).to_string_lossy();
+            Ok(name)
+        }
+    }
+
+    pub fn get_origin(&self) -> Option<String> {
+        unsafe {
+            let ptr = lvm_lv_get_origin(self.handle);
+            if ptr.is_null() {
+                return None;
+            }
+            let origin = CStr::from_ptr(ptr).to_string_lossy();
+            Some(origin)
+        }
+    }
+
+    /// Get the current size in bytes of a logical volume
+    pub fn get_size(&self) -> u64 {
+        unsafe {
+            lvm_lv_get_size(self.handle)
+        }
+    }
+
+    /// Get the current name of a logical volume
+    pub fn get_uuid(&self) -> LvmResult<Uuid> {
+        unsafe {
+            let uuid = lvm_lv_get_uuid(self.handle);
+            let name = CStr::from_ptr(uuid).to_string_lossy();
+            ids.push(Uuid::from_str(&name)?);
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        unsafe {
+            let active = lvm_lv_is_active(self.handle);
+            active == 1
+        }
+    }
+
+    pub fn is_suspended(&self) -> bool {
+        unsafe {
+            let suspended = lvm_lv_is_suspended(self.handle);
+            suspended == 1
+        }
+    }
+
+    /// Remove a logical volume from a volume group
+    pub fn remove(&self) -> LvmResult<()> {
+        unsafe {
+            let retcode = lvm_vg_remove_lv(self.handle);
+            self.check_retcode(retcode)?;
+            Ok(())
+        }
+    }
+
+    pub fn remove_tag(&self, name: &str) -> LvmResult<()> {
+        unsafe {
+            let retcode = lvm_lv_remove_tag(self.handle);
+            self.check_retcode(retcode)?;
+            self.vg.write()?;
+            Ok(())
+        }
+    }
+
+}
 
 impl Lvm {
     fn check_retcode(&self, retcode: i32) -> LvmResult<()> {
