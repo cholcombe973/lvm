@@ -285,6 +285,7 @@ impl<'a, 'b> LogicalVolume<'a, 'b> {
         }
     }
 
+    /// Get the origin of a snapshot
     pub fn get_origin(&self) -> Option<String> {
         unsafe {
             let ptr = lvm_lv_get_origin(self.handle);
@@ -323,11 +324,12 @@ impl<'a, 'b> LogicalVolume<'a, 'b> {
     }
 
     /// Get the current name of a logical volume
-    pub fn get_uuid(&self) -> LvmResult<Uuid> {
+    pub fn get_uuid(&self) -> String {
         unsafe {
             let uuid = lvm_lv_get_uuid(self.handle);
             let name = CStr::from_ptr(uuid).to_string_lossy();
-            Ok(Uuid::from_str(&name)?)
+
+            name.into_owned()
         }
     }
 
@@ -682,11 +684,11 @@ impl<'a> PhysicalVolume<'a> {
     }
     */
 
-    pub fn get_uuid(&self) -> LvmResult<Uuid> {
+    pub fn get_uuid(&self) -> String {
         unsafe {
             let id = lvm_pv_get_uuid(self.handle);
             let tmp = CStr::from_ptr(id).to_string_lossy();
-            Ok(Uuid::from_str(&tmp)?)
+            tmp.into_owned()
         }
     }
 
@@ -888,12 +890,12 @@ impl<'a> VolumeGroup<'a> {
     }
 
     /// Get the current uuid of a volume group
-    pub fn get_uuid(&self) -> LvmResult<Uuid> {
+    pub fn get_uuid(&self) -> String {
         unsafe {
             let uid = lvm_vg_get_uuid(self.handle);
             let tmp = CStr::from_ptr(uid).to_string_lossy();
 
-            Ok(Uuid::from_str(&tmp)?)
+            tmp.into_owned()
         }
     }
 
