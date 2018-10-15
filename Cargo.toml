@@ -2,7 +2,7 @@
 name = "lvm"
 description = "LVM safe bindings"
 homepage = "https://github.com/cholcombe973/lvm"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Chris Holcombe <xfactor973@gmail.com>"]
 license = "MIT"
 catagories = ["api-bindings"]
