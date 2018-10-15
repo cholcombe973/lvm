@@ -731,13 +731,48 @@ impl<'a> VolumeGroup<'a> {
     }
 
     /// Return a list of LV handles for a given VG handle
-    pub fn list_lvs(&self) -> LvmResult<Vec<String>> {
-        Ok(vec![])
+    pub fn list_lvs(&self) -> LvmResult<Vec<LogicalVolume>> {
+        let mut lvs: Vec<LogicalVolume> = vec![];
+        unsafe {
+            let lv_head = lvm_vg_list_lvs(self.handle);
+            let mut lv = dm_list_first(lv_head);
+            loop {
+                if lv.is_null() {
+                    break;
+                }
+                let lv_list = lv as *mut lvm_lv_list;
+                lvs.push(LogicalVolume{
+                    handle: (*lv_list).lv,
+                    lvm: self.lvm,
+                    vg: self,
+                });
+                lv = dm_list_next(lv_head, lv);
+            }
+        }
+
+        Ok(lvs)
     }
 
     /// Return a list of PV handles for all
-    pub fn list_pvs(&self) -> LvmResult<Vec<String>> {
-        Ok(vec![])
+    pub fn list_pvs(&self) -> LvmResult<Vec<PhysicalVolume>> {
+     let mut pvs: Vec<PhysicalVolume> = vec![];
+        unsafe {
+            let pv_head = lvm_vg_list_pvs(self.handle);
+            let mut pv = dm_list_first(pv_head);
+            loop {
+                if pv.is_null() {
+                    break;
+                }
+                let pv_list = pv as *mut lvm_pv_list;
+                pvs.push(PhysicalVolume{
+                    handle: (*pv_list).pv,
+                    lvm: self.lvm,
+                });
+                pv = dm_list_next(pv_head, pv);
+            }
+        }
+
+        Ok(pvs)
     }
 
     /// Create a linear logical volume
