@@ -29,11 +29,11 @@
 //!  whether the original "vg_seqno" obtained with READ permission matches
 //!  the new one obtained with WRITE permission.
 
-extern crate errno;
+use errno;
 #[macro_use]
 extern crate log;
-extern crate lvm_sys;
-extern crate uuid;
+
+use uuid;
 
 use std::error::Error as err;
 use std::ffi::{CStr, CString, NulError};
@@ -59,7 +59,7 @@ pub enum LvmError {
 }
 
 impl fmt::Display for LvmError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.description())
     }
 }
@@ -73,7 +73,7 @@ impl err for LvmError {
             LvmError::ParseError(ref e) => e.description(),
         }
     }
-    fn cause(&self) -> Option<&err> {
+    fn cause(&self) -> Option<&dyn err> {
         match *self {
             LvmError::Error(_) => None,
             LvmError::IoError(ref e) => e.cause(),
@@ -387,7 +387,11 @@ impl<'a, 'b> LogicalVolume<'a, 'b> {
     /// Create a snapshot of a logical volume
     /// Max snapshot space to use. If you pass zero the same amount of space
     /// as the origin will be used
-    pub fn snapshot(&self, snap_name: &str, max_snap_size: u64) -> LvmResult<LogicalVolume> {
+    pub fn snapshot(
+        &self,
+        snap_name: &str,
+        max_snap_size: u64,
+    ) -> LvmResult<LogicalVolume<'_, '_>> {
         let snap_name = CString::new(snap_name)?;
         unsafe {
             let lv_t = lvm_lv_snapshot(self.handle, snap_name.as_ptr(), max_snap_size);
@@ -431,6 +435,12 @@ impl Lvm {
 
                 unsafe {
                     let handle = lvm_init(d.as_ptr());
+                    if handle.is_null() {
+                        return Err(LvmError::new((
+                            errno::errno(),
+                            "Memory allocation problem".into(),
+                        )));
+                    }
                     Ok(Lvm { handle })
                 }
             }
@@ -438,6 +448,12 @@ impl Lvm {
                 let p = ptr::null();
                 unsafe {
                     let handle = lvm_init(p);
+                    if handle.is_null() {
+                        return Err(LvmError::new((
+                            errno::errno(),
+                            "Memory allocation problem".into(),
+                        )));
+                    }
                     Ok(Lvm { handle })
                 }
             }
@@ -448,6 +464,10 @@ impl Lvm {
         let mut names: Vec<String> = vec![];
         unsafe {
             let vg_names = lvm_list_vg_names(self.handle);
+            if vg_names.is_null() {
+                let err = self.get_error()?;
+                return Err(LvmError::new((err.0, err.1)));
+            }
             let mut vg = dm_list_first(vg_names);
             loop {
                 if vg.is_null() {
@@ -469,6 +489,10 @@ impl Lvm {
         let mut ids: Vec<Uuid> = vec![];
         unsafe {
             let vg_uuids = lvm_list_vg_uuids(self.handle);
+            if vg_uuids.is_null() {
+                let err = self.get_error()?;
+                return Err(LvmError::new((err.0, err.1)));
+            }
             let mut vg = dm_list_first(vg_uuids);
             loop {
                 if vg.is_null() {
@@ -505,7 +529,7 @@ impl Lvm {
         Ok(())
     }
 
-    pub fn pv_create_params(&self, pv_name: &str) -> LvmResult<PhysicalVolumeCreateParameters> {
+    pub fn pv_create_params(&self, pv_name: &str) -> LvmResult<PhysicalVolumeCreateParameters<'_>> {
         let name = CString::new(pv_name)?;
         unsafe {
             let pv_params = lvm_pv_params_create(self.handle, name.as_ptr());
@@ -572,7 +596,7 @@ impl Lvm {
     /// Once all parameters are set appropriately and all devices are added to the
     /// VG, use lvm_vg_write() to commit the new VG to disk, and lvm_vg_close() to
     /// release the VG handle.
-    pub fn vg_create(&self, name: &str) -> LvmResult<VolumeGroup> {
+    pub fn vg_create(&self, name: &str) -> LvmResult<VolumeGroup<'_>> {
         let name = CString::new(name)?;
         unsafe {
             let vg_t = lvm_vg_create(self.handle, name.as_ptr());
@@ -587,7 +611,7 @@ impl Lvm {
         }
     }
 
-    pub fn vg_open(&self, name: &str, mode: &OpenMode) -> LvmResult<VolumeGroup> {
+    pub fn vg_open(&self, name: &str, mode: &OpenMode) -> LvmResult<VolumeGroup<'_>> {
         let name = CString::new(name)?;
         let mode = CString::new(mode.to_string())?;
         unsafe {
@@ -731,8 +755,8 @@ impl<'a> VolumeGroup<'a> {
     }
 
     /// Return a list of LV handles for a given VG handle
-    pub fn list_lvs(&self) -> LvmResult<Vec<LogicalVolume>> {
-        let mut lvs: Vec<LogicalVolume> = vec![];
+    pub fn list_lvs(&self) -> LvmResult<Vec<LogicalVolume<'_, '_>>> {
+        let mut lvs: Vec<LogicalVolume<'_, '_>> = vec![];
         unsafe {
             let lv_head = lvm_vg_list_lvs(self.handle);
             let mut lv = dm_list_first(lv_head);
@@ -741,7 +765,7 @@ impl<'a> VolumeGroup<'a> {
                     break;
                 }
                 let lv_list = lv as *mut lvm_lv_list;
-                lvs.push(LogicalVolume{
+                lvs.push(LogicalVolume {
                     handle: (*lv_list).lv,
                     lvm: self.lvm,
                     vg: self,
@@ -754,8 +778,8 @@ impl<'a> VolumeGroup<'a> {
     }
 
     /// Return a list of PV handles for all
-    pub fn list_pvs(&self) -> LvmResult<Vec<PhysicalVolume>> {
-     let mut pvs: Vec<PhysicalVolume> = vec![];
+    pub fn list_pvs(&self) -> LvmResult<Vec<PhysicalVolume<'_>>> {
+        let mut pvs: Vec<PhysicalVolume<'_>> = vec![];
         unsafe {
             let pv_head = lvm_vg_list_pvs(self.handle);
             let mut pv = dm_list_first(pv_head);
@@ -764,7 +788,7 @@ impl<'a> VolumeGroup<'a> {
                     break;
                 }
                 let pv_list = pv as *mut lvm_pv_list;
-                pvs.push(PhysicalVolume{
+                pvs.push(PhysicalVolume {
                     handle: (*pv_list).pv,
                     lvm: self.lvm,
                 });
@@ -776,7 +800,7 @@ impl<'a> VolumeGroup<'a> {
     }
 
     /// Create a linear logical volume
-    pub fn create_lv_linear(&self, name: &str, size: u64) -> LvmResult<LogicalVolume> {
+    pub fn create_lv_linear(&self, name: &str, size: u64) -> LvmResult<LogicalVolume<'_, '_>> {
         let name = CString::new(name)?;
         unsafe {
             let lv_t = lvm_vg_create_lv_linear(self.handle, name.as_ptr(), size);
@@ -960,7 +984,7 @@ impl<'a> VolumeGroup<'a> {
         }
     }
 
-    pub fn lv_from_name(&self, name: &str) -> LvmResult<LogicalVolume> {
+    pub fn lv_from_name(&self, name: &str) -> LvmResult<LogicalVolume<'_, '_>> {
         let name = CString::new(name)?;
         unsafe {
             let lv_t = lvm_lv_from_name(self.handle, name.as_ptr());
@@ -989,7 +1013,7 @@ impl<'a> VolumeGroup<'a> {
     }
 
     /// Lookup an PV handle in a VG by the PV name.
-    pub fn pv_from_name(&self, name: &str) -> LvmResult<PhysicalVolume> {
+    pub fn pv_from_name(&self, name: &str) -> LvmResult<PhysicalVolume<'_>> {
         let name = CString::new(name)?;
         unsafe {
             let pv_t = lvm_pv_from_name(self.handle, name.as_ptr());
@@ -1005,7 +1029,7 @@ impl<'a> VolumeGroup<'a> {
     }
 
     /// Lookup an PV handle in a VG by the PV uuid
-    pub fn pv_from_uuid(&self, id: &Uuid) -> LvmResult<PhysicalVolume> {
+    pub fn pv_from_uuid(&self, id: &Uuid) -> LvmResult<PhysicalVolume<'_>> {
         let id = CString::new(id.as_bytes().to_vec())?;
         unsafe {
             let pv_t = lvm_pv_from_uuid(self.handle, id.as_ptr());
