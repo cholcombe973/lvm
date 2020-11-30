@@ -395,7 +395,10 @@ impl<'a, 'b> LogicalVolume<'a, 'b> {
         let snap_name = CString::new(snap_name)?;
         unsafe {
             let lv_t = lvm_lv_snapshot(self.handle, snap_name.as_ptr(), max_snap_size);
-            if lv_t.is_null() {}
+            if lv_t.is_null() {
+                let err = self.lvm.get_error()?;
+                return Err(LvmError::new((err.0, err.1)));
+            }
             Ok({
                 LogicalVolume {
                     handle: lv_t,
