@@ -55,7 +55,7 @@ pub enum LvmError {
     Error((Errno, String)),
     IoError(IOError),
     NulError(NulError),
-    ParseError(uuid::parser::ParseError),
+    ParseError(uuid::Error),
 }
 
 impl fmt::Display for LvmError {
@@ -102,8 +102,8 @@ impl From<NulError> for LvmError {
     }
 }
 
-impl From<uuid::parser::ParseError> for LvmError {
-    fn from(err: uuid::parser::ParseError) -> LvmError {
+impl From<uuid::Error> for LvmError {
+    fn from(err: uuid::Error) -> LvmError {
         LvmError::ParseError(err)
     }
 }
